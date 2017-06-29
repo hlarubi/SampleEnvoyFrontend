@@ -1,0 +1,7 @@
+---
+applications:
+- name:    test-frontend-noSSL-envoy
+  host:    test-frontend-noSSL-envoy
+  memory:  128M
+  env:
+    BLUEMIX_ENVOY_INSTALL: true

@@ -1,0 +1,271 @@
+{
+  "statsd_tcp_cluster_name": "statsd", #All stats will be pushed periodically to this cluster.
+  "admin": {
+    "access_log_path": "/dev/null",
+    "port": 5000
+  },  
+  "listeners": [
+    {
+      ## This is for ingress traffic [ internet -> CF app]. This port should be the VCAP_ENV_PORT
+      "port": 5555,
+      "filters": [
+        {
+          "type": "read",
+          "name": "http_connection_manager",
+          "config": {
+            "codec_type": "auto",
+            "stat_prefix": "ingress_http",
+            "route_config": {
+              "virtual_hosts": [
+                {
+                  "name": "ingress_envoy_service_name",
+                  "domains": [ "*" ],
+                  "routes": [
+                    {
+                      "prefix": "/",
+                      "cluster": "inbound:9080",
+                      "timeout_ms": 30000,
+                      "retry_policy": {
+                        "retry_on": "5xx,connect-failure,refused-stream",
+                        "num_retries": 1
+                         ## NOTE: timeout_ms includes time spent on retries as well.
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            "filters": [
+              {
+                # This is inbound health check from other Envoys
+                "type": "both",
+                "name": "health_check",
+                "config": {
+                  "pass_through_mode": false,
+                  "endpoint": "/healthcheck"
+                }
+              },
+              {
+                "type": "decoder",
+                "name": "router",
+                "config": {}
+              }
+            ],
+            "access_log": [
+              {
+                # See https://github.com/lyft/envoy/blob/master/configs/envoy_service_to_service.template.json#L18
+                "path": "/path/to/access/log/for/incoming/requests_OR_/dev/null"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+     ## This is for egress traffic from CF app to other backends or external services,
+     ## App in CF container accesses local envoy via http://localhost:9081 to make outbound calls.
+     ## There are other sophisticated methods possible, but I am omitting it to keep things simple
+      "port": 9081,
+      "filters": [
+        {
+          "type": "read",
+          "name": "http_connection_manager",
+          "config": {
+            "codec_type": "auto",
+            "stat_prefix": "egress_http",
+            "route_config": {
+              "virtual_hosts": [
+                {
+                  "name": "outbound:payment",
+                  #In this case, the caller should supply HTTP host header "Host: payment.mybluemix.net",
+                  #while calling localhost:9081
+                  "domains": [ "payment.mybluemix.net" ],
+                  "routes": [
+                    {
+                      "prefix": "/",
+                      "cluster": "outbound:payment.mybluemix.net",
+                      # Always set the parameter below to true for egress traffic out of envoy to bluemix routes,
+                      # or when incoming traffic does not provide a valid host header (such as when talking to
+                      # local envoy to reach external service. Essentially, set it to true for all egress traffic.)
+                      "auto_host_rewrite" : true,
+                      "timeout_ms": 30000
+                      # No retries
+                    }
+                  ]
+                },
+                {
+                  "name": "outbound:catalog",
+                  # Notice use of wildcard domain. Cannot use *.mybluemix.net. Just one big wildcard
+                  "domains": [ "*" ],
+                  "routes": [
+                    {
+                      "prefix": "/catalog",
+                      # Notice choice of specific cluster in the route. When switching from dev to prod,
+                      # you can simply change this cluster parameter alone to point to outbound:catalog-prod
+                      "cluster": "outbound:catalog-dev",
+                      "auto_host_rewrite" : true,
+                      "timeout_ms": 40000,
+                      "retry_policy": {
+                        "retry_on": "5xx,connect-failure,refused-stream",
+                        "num_retries": 3
+                        ## NOTE: timeout_ms includes time spent on retries as well.
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            "filters": [
+              {
+                "type": "decoder",
+                "name": "router",
+                "config": {}
+              }
+            ],
+            "access_log": [
+              {
+                "path": "/dev/stdout"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "cluster_manager": {
+    "clusters": [
+      {
+        "name": "inbound:9080",
+        "connect_timeout_ms": 1000,
+        #Bulk heads https://lyft.github.io/envoy/docs/intro/arch_overview/circuit_breaking.html
+        "max_requests_per_connection": 100,
+        "circuit_breakers": {
+          "default": {
+            "max_connections": 100,
+            "max_pending_requests": 100,
+            "max_requests": 100
+          }
+        },
+        #Circuit breakers https://lyft.github.io/envoy/docs/intro/arch_overview/outlier.html
+        "outlier_detection": {
+          "consecutive_5xx": 10,
+          "interval_ms": 30000,
+          "base_ejection_time_ms": 15500,
+          "max_ejection_percent": 100
+        },
+        #health checks https://lyft.github.io/envoy/docs/configuration/cluster_manager/cluster_hc.html#config-cluster-manager-cluster-hc
+        "health_check" : {
+          "type" : "http",
+          "timeout_ms" : 5000,
+          "interval_ms" : 10000,
+          "unhealthy_threshold" : 6,
+          "healthy_threshold" : 6,
+          "path" : "/localservice/localhealthcheck"
+        },
+        "type": "static",
+        "lb_type": "round_robin",
+        "hosts": [
+          {
+            "url": "tcp://127.0.0.1:9080"
+          }
+        ]
+      },
+      {
+        "name": "outbound:catalog-dev",
+        "connect_timeout_ms": 1000,
+        #https://lyft.github.io/envoy/docs/intro/arch_overview/circuit_breaking.html
+        "max_requests_per_connection": 100,
+        "circuit_breakers": {
+          "default": {
+            "max_connections": 100,
+            "max_pending_requests": 100,
+            "max_requests": 100
+          }
+        },
+        #https://lyft.github.io/envoy/docs/intro/arch_overview/outlier.html
+        "outlier_detection": {
+          "consecutive_5xx": 10,
+          "interval_ms": 30000,
+          "base_ejection_time_ms": 15500,
+          "max_ejection_percent": 100
+        },
+        #https://lyft.github.io/envoy/docs/configuration/cluster_manager/cluster_hc.html#config-cluster-manager-cluster-hc
+        "health_check" : {
+          "type" : "http",
+          "timeout_ms" : 5000,
+          "interval_ms" : 10000,
+          "unhealthy_threshold" : 6,
+          "healthy_threshold" : 6,
+          "path" : "/catalogservice/catalog_healthcheck"
+        },
+        # Auth from caller to backend services needed only for mutual TLS auth
+        # https://lyft.github.io/envoy/docs/configuration/cluster_manager/cluster_ssl.html#config-cluster-manager-cluster-ssl
+        "ssl_context" : {
+          "cert_chain_file" : "path_to_client_tls_certificate",
+          "private_key_file" : "path_to_private_key_for_certificate",
+          "ca_cert_file" : "file_with_list_of_trusted_CAs_to_verify_server_cert"
+        },
+        "type": "strict_dns",
+        "lb_type": "round_robin",
+        "hosts" : [
+          {
+            # There can be a hundred instances behind this bluemix route.
+            # Envoy will just do a dns resolution every 5s and
+            # send resolving IP address.
+            "url" : "tcp://catalog-dev.mybluemix.net:80"
+          }
+        ]
+      },
+      {
+        "name": "outbound:catalog-prod",
+        "connect_timeout_ms": 1000,
+        #https://lyft.github.io/envoy/docs/intro/arch_overview/circuit_breaking.html
+        "max_requests_per_connection": 100,
+        "circuit_breakers": {
+          "default": {
+            "max_connections": 100,
+            "max_pending_requests": 100,
+            "max_requests": 100
+          }
+        },
+        #https://lyft.github.io/envoy/docs/intro/arch_overview/outlier.html
+        "outlier_detection": {
+          "consecutive_5xx": 10,
+          "interval_ms": 30000,
+          "base_ejection_time_ms": 15500,
+          "max_ejection_percent": 100
+        },
+        #https://lyft.github.io/envoy/docs/configuration/cluster_manager/cluster_hc.html#config-cluster-manager-cluster-hc
+        "health_check" : {
+          "type" : "http",
+          "timeout_ms" : 5000,
+          "interval_ms" : 10000,
+          "unhealthy_threshold" : 6,
+          "healthy_threshold" : 6,
+          "path" : "/catalogservice/catalog_healthcheck"
+        },
+        "type": "strict_dns",
+        "lb_type": "round_robin",
+        ## Auth from caller to backend service. No mutual TLS. Just accepting HTTPs cert from server.
+        # Leave a blank ssl_context block to enable SSL but disable server certificate validation, client certificate exchange, etc.
+        "ssl_context" : {},
+        "hosts" : [
+          {
+            # There can be a hundred instances behind this bluemix route.
+            # Envoy will just do a dns resolution every 5s and
+            # send resolving IP address.
+            "url" : "tcp://catalog-prod.mybluemix.net:80"
+          }
+        ]
+      },
+      {
+        "name": "statsd",
+        "connect_timeout_ms": 250,
+        "type": "strict_dns",
+        "lb_type": "round_robin",
+        #https://github.com/etsy/statsd/blob/master/docs/backend.md
+        "hosts": [{"url": "tcp://statsd-backend.example.com:8125"}]
+      }
+    ]
+  }
+}
